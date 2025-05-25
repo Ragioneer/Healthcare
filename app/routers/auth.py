@@ -21,7 +21,7 @@ from datetime import timedelta
 from app.utils.email import send_verification_email
 import os
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "https://healthcare.ragioneer.com")
+FRONTEND_URL = os.getenv("FRONTEND_URL")
 
 router = APIRouter(tags=["auth"])
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -83,7 +83,8 @@ async def signup(user: UserSignup):
     }
 
     result = await users_collection.insert_one(user_doc)
-    verification_link = f"{FRONTEND_URL}/verify-email?token={verification_token}"
+    verification_link = f"{FRONTEND_URL}/verify-email?token={verification_token}&email={user.email}"
+
 
     # SEND EMAIL!
     try:
@@ -172,13 +173,17 @@ async def logout():
 
 @router.get("/verify-email")
 async def verify_email(token: str):
+    """
+    Verify user email using the one-time token.
+    On success, mark the user as verified and issue an access token.
+    """
     user = await users_collection.find_one({"verification_token": token})
-    if not user or user.get("verified"):
-        return JSONResponse(status_code=400, content={"detail": "Invalid or expired verification link."})
+    if not user or user.get("verified", False):
+        return JSONResponse(status_code=401, content={"detail": "Invalid or expired verification link."})
 
     expiry = user.get("verification_token_expiry")
     if expiry and datetime.utcnow() > expiry:
-        return JSONResponse(status_code=400, content={"detail": "Verification link expired."})
+        return JSONResponse(status_code=401, content={"detail": "Verification link expired."})
 
     await users_collection.update_one(
         {"_id": user["_id"]},
@@ -188,18 +193,37 @@ async def verify_email(token: str):
         }
     )
 
-    return JSONResponse({"message": "Email verified successfully."})
-
+    access_token = create_access_token(data={
+        "sub": str(user["_id"]),
+        "email": user["email"],
+        "role": user.get("role", "user")
+    })
+    return {
+        "message": "Email verified successfully.",
+        "access_token": access_token
+    }
 
 @router.post("/resend-verification")
 async def resend_verification(req: ResendVerificationRequest):
-    email = req.email
+    """
+    Resend the email verification link to the user if not yet verified.
+    """
+    email = req.email.strip().lower()
     user = await users_collection.find_one({"email": email})
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
-    if user.get("verified"):
-        raise HTTPException(status_code=400, detail="Email already verified.")
 
+    if not user:
+        return {
+            "success": False,
+            "message": "User not found."
+        }
+
+    if user.get("verified", False):
+        return {
+            "success": False,
+            "message": "Your email is already verified. Please log in."
+        }
+
+    # Generate new token and expiry
     verification_token = secrets.token_urlsafe(32)
     verification_token_expiry = datetime.utcnow() + timedelta(hours=1)
     await users_collection.update_one(
@@ -211,6 +235,18 @@ async def resend_verification(req: ResendVerificationRequest):
             }
         }
     )
+
     verification_link = f"{FRONTEND_URL}/verify-email?token={verification_token}&email={email}"
-    await send_verification_email(email, verification_link)
-    return {"message": "Verification email resent. Please check your inbox."}
+
+    try:
+        await send_verification_email(email, verification_link)
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to send verification email: {str(e)}"
+        }
+
+    return {
+        "success": True,
+        "message": "Verification email sent successfully! Please check your inbox."
+    }
